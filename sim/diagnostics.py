@@ -42,8 +42,16 @@ def diag_wifi(src):
     check("WiFi.mode(WIFI_STA) called before scan",
           "WiFi.mode(WIFI_STA)" in src)
 
+    check("WiFi async scan (scanNetworks(true))",
+          "WiFi.scanNetworks(true)" in src,
+          detail="non-blocking — loop stays responsive")
+
     check("esp_wifi_80211_tx used for deauth",
           "esp_wifi_80211_tx" in src)
+
+    check("esp_wifi_set_promiscuous(true) before TX",
+          "esp_wifi_set_promiscuous(true)" in src,
+          detail="required for raw frame injection on newer ESP-IDF")
 
     check("esp_wifi_set_channel called before TX",
           "esp_wifi_set_channel" in src)
@@ -51,7 +59,6 @@ def diag_wifi(src):
     check("WiFi.scanDelete() called on exit",
           "WiFi.scanDelete()" in src)
 
-    # Frame length must be 26
     frame_match = re.search(r"deauth_frame\[(\d+)\]", src)
     if frame_match:
         flen = int(frame_match.group(1))
@@ -64,15 +71,31 @@ def diag_wifi(src):
           "WiFi.mode(WIFI_OFF)" in src,
           detail="prevents WiFi/BLE radio contention")
 
+    check("Scroll clamped (not modulo wrap)",
+          "min(wifiScroll + 1" in src,
+          detail="last page never shows blank entries")
+
+    check("Hidden network shows '(hidden)'",
+          "length() == 0" in src and "hidden" in src,
+          detail="empty SSID string = hidden network")
+
 
 def diag_ble(src):
     print("\n[B] BLE Diagnostics")
 
-    check("BLEDevice::init() called",        "BLEDevice::init" in src)
-    check("BLEDevice::deinit() called",       "BLEDevice::deinit" in src,
-          detail="must free radio before WiFi re-init")
-    check("bleScan->clearResults() called",   "clearResults()" in src)
-    check("setActiveScan(true) for RSSI",     "setActiveScan(true)" in src)
+    check("BLEDevice::init(\"\") — no advertising during scan",
+          'BLEDevice::init("")' in src,
+          detail="empty name suppresses BLE advertising")
+
+    check("BLEDevice::deinit() called",
+          "BLEDevice::deinit" in src,
+          detail="frees radio before WiFi re-init")
+
+    check("bleScan->clearResults() called",
+          "clearResults()" in src)
+
+    check("setActiveScan(true) for RSSI",
+          "setActiveScan(true)" in src)
 
 
 def diag_nrf(src):
@@ -81,6 +104,10 @@ def diag_nrf(src):
     check("radio.begin() return checked",
           "radio.begin()" in src and ("!radio.begin()" in src or "nrfOk" in src))
 
+    check("radio.powerDown() on error path (nrf_spectrum_enter)",
+          "radio.powerDown()" in src and "NRF24 not found" in src,
+          detail="called before returning to MENU on init failure")
+
     check("radio.setAutoAck(false) for sweep",
           "setAutoAck(false)" in src)
 
@@ -88,8 +115,17 @@ def diag_nrf(src):
           "testRPD()" in src,
           detail="testRPD() works on NRF24L01+; testCarrier() only on legacy NRF24L01")
 
-    check("radio.powerDown() on exit",
-          "radio.powerDown()" in src)
+    check("radio.powerDown() on SEL exit",
+          src.count("radio.powerDown()") >= 2,
+          detail="called on both error path and normal exit")
+
+    check("NRF rise == fall rate (no smear)",
+          "nrfPower[ch] += 8" in src,
+          detail="equal rise/fall = accurate spectrum")
+
+    check("2-channel subsampling (63 pairs × 2px)",
+          "NRF_CH_COUNT / 2" in src and "pair * 2" in src,
+          detail="126 channels → 126px, no collision")
 
     check("NRF channel count == 126",
           "NRF_CH_COUNT 126" in src or "126" in src)
@@ -101,10 +137,11 @@ def diag_nrf(src):
 def diag_oled(src):
     print("\n[D] OLED / I2C Diagnostics")
 
-    check("I2C address 0x3C used", "0x3C" in src)
+    check("I2C address 0x3C used",              "0x3C" in src)
     check("Wire.begin(21, 22) explicit pin init", "Wire.begin(21, 22)" in src)
-    check("display.display() called after draw",  "oled.display()" in src)
-    check("display.clearDisplay() called",        "oled.clearDisplay()" in src)
+    check("oled.begin() return checked",          "!oled.begin(" in src)
+    check("oled.display() called after draw",     "oled.display()" in src)
+    check("oled.clearDisplay() called",           "oled.clearDisplay()" in src)
 
 
 def diag_gpio(src):
@@ -113,28 +150,39 @@ def diag_gpio(src):
     btn_next_match = re.search(r"BTN_NEXT\s+(\d+)", src)
     btn_sel_match  = re.search(r"BTN_SEL\s+(\d+)", src)
 
-    if btn_next_match and btn_sel_match:
-        btn_next = int(btn_next_match.group(1))
-        btn_sel  = int(btn_sel_match.group(1))
-        input_only = {34, 35, 36, 39}
+    # [fix #17] explicit fallback when regex fails
+    if btn_next_match is None:
+        check("BTN_NEXT define found", False,
+              detail="regex matched nothing — define may have been renamed")
+        return
+    if btn_sel_match is None:
+        check("BTN_SEL define found", False,
+              detail="regex matched nothing — define may have been renamed")
+        return
 
-        check(f"BTN_NEXT GPIO{btn_next} supports INPUT_PULLUP",
-              btn_next not in input_only,
-              level="warn" if btn_next in input_only else "pass",
-              detail="GPIO34/35/36/39 = input-only, no internal pullup")
+    btn_next   = int(btn_next_match.group(1))
+    btn_sel    = int(btn_sel_match.group(1))
+    input_only = {34, 35, 36, 39}
 
-        check(f"BTN_SEL GPIO{btn_sel} supports INPUT_PULLUP",
-              btn_sel not in input_only,
-              level="warn" if btn_sel in input_only else "pass",
-              detail="GPIO34/35/36/39 = input-only, no internal pullup")
-    else:
-        check("BTN_NEXT/BTN_SEL defines found", False)
+    check(f"BTN_NEXT GPIO{btn_next} supports INPUT_PULLUP",
+          btn_next not in input_only,
+          level="warn" if btn_next in input_only else "pass",
+          detail="GPIO34/35/36/39 = input-only, no internal pullup")
+
+    check(f"BTN_SEL GPIO{btn_sel} supports INPUT_PULLUP",
+          btn_sel not in input_only,
+          level="warn" if btn_sel in input_only else "pass",
+          detail="GPIO34/35/36/39 = input-only, no internal pullup")
 
     check("INPUT_PULLUP used for buttons",
           "INPUT_PULLUP" in src)
 
-    check("Debounce present (>200ms)",
-          "220" in src or "200" in src or "debounce" in src.lower())
+    check("Per-button debounce timestamps",
+          "lastBtnNextMs" in src and "lastBtnSelMs" in src,
+          detail="shared timestamp can miss simultaneous presses")
+
+    check("Debounce > 200ms",
+          "220" in src or "200" in src)
 
 
 def diag_coexistence(src):
@@ -148,9 +196,12 @@ def diag_coexistence(src):
           "deinit" in src,
           detail="prevents driver state corruption on mode switch")
 
+    check("on_mode_exit() teardown before every transition",
+          "on_mode_exit" in src,
+          detail="guards against direct mode-to-mode transitions")
+
     check("Mode state machine prevents concurrent WiFi+BLE",
-          "enum Mode" in src or "enum class Mode" in src or "Mode mode" in src,
-          detail="single active mode at a time by design")
+          "enum Mode" in src or "Mode mode" in src)
 
 
 def main():

