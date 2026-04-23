@@ -28,7 +28,7 @@ Same async scan as above. After the user selects a target AP, `deauth_send()` co
 WiFi radio is disabled first to avoid coexistence conflicts. Runs a 3-second active BLE scan via the ESP32 Arduino BLE library. Each result shows the advertised device name (falls back to MAC address if unnamed) and RSSI. BLE is fully deinited on exit to free the radio.
 
 ### NRF Spectrum
-Uses the NRF24L01's RPD (Received Power Detector) register — a 1-bit flag that reads `1` if any signal above −64 dBm was detected on the current channel in the last ~128 µs. The firmware sweeps all 126 channels (ch 0 = 2402 MHz … ch 125 = 2527 MHz): for each channel it sets the frequency, starts listening for 128 µs, stops, then reads RPD. A `uint8_t` accumulator per channel rises by 8 on a hit and falls by 8 on a miss, producing smooth decay. Channel pairs are averaged and drawn as 2-pixel-wide vertical bars across the 128-pixel OLED width. Three marker dots at the top indicate WiFi channels 1, 6, and 11.
+Uses the NRF24L01's RPD (Received Power Detector) register — a 1-bit flag that reads `1` if any signal above −64 dBm was detected on the current channel in the last ~128 µs. The firmware sweeps all 126 channels (ch 0 = 2400 MHz … ch 125 = 2525 MHz): for each channel it sets the frequency, starts listening for 128 µs, stops, then reads RPD. A `uint8_t` accumulator per channel rises by 8 on a hit and falls by 8 on a miss, producing smooth decay. Channel pairs are averaged and drawn as 2-pixel-wide vertical bars across the 128-pixel OLED width. Three marker dots at the top indicate WiFi channels 1, 6, and 11.
 
 ---
 
@@ -169,14 +169,14 @@ Power on → 2-second splash screen → main menu.
 | BTN_SEL | Enter selected mode | Exit back to menu |
 
 ### WiFi Scan
-Async scan across all channels. Shows SSID (or `(hidden)` for hidden networks), channel number, and RSSI in dBm. BTN_NEXT scrolls 3 results at a time. BTN_SEL during scan cancels it; BTN_SEL on results returns to menu.
+Async scan across all channels. Shows SSID (or `(hidden)` for hidden networks), channel number, and RSSI in dBm. BTN_NEXT scrolls 1 result per press (3 visible at once). BTN_SEL during scan cancels it; BTN_SEL on results returns to menu.
 
 ### WiFi Deauth
 Scans for APs first. BTN_NEXT scrolls through discovered targets showing SSID, channel, and RSSI. BTN_SEL on a target starts continuous deauth — the screen shows `DEAUTHING:` and the target SSID. BTN_SEL again stops and returns to menu.
 **Authorized networks only.**
 
 ### BLE Scan
-Runs a 3-second passive BLE scan. Results show device name (or MAC address if the device has no name) and RSSI. BTN_NEXT scrolls. BTN_SEL exits and fully releases the BLE radio.
+Runs a 3-second active BLE scan (sends SCAN_REQ to retrieve device names from SCAN_RSP). Results show device name (or MAC address if the device has no name) and RSSI. BTN_NEXT scrolls. BTN_SEL cancels or exits and fully releases the BLE radio.
 
 ### NRF Spectrum
 Live 2.4 GHz bar graph. The NRF24L01 sweeps all 126 channels continuously, each bar decaying smoothly when signal disappears. Three dots at the top of the display mark WiFi channels 1, 6, and 11 so you can spot WiFi congestion instantly. BTN_SEL exits and powers down the NRF radio.

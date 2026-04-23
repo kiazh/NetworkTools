@@ -154,6 +154,7 @@ static void wifi_scan_handle() {
     oled_header("WiFi Scan");
     if (wifiCount == 0) {
         oled.println("No networks");
+        oled.println("SEL=back");
     } else {
         oled.print(wifiCount); oled.println(" found. NEXT/SEL");
         for (int i = wifiScroll; i < min(wifiScroll + 3, wifiCount); i++) {
@@ -394,7 +395,7 @@ static void nrf_draw() {
         }
     }
     // WiFi ch1/6/11 → NRF ch12/37/62 → pair 6/18/31 → x 12/36/62
-    for (uint8_t pair : {6, 18, 31}) {
+    for (int pair : {6, 18, 31}) {
         oled.drawPixel(pair * 2, BAR_TOP, SSD1306_WHITE);
     }
     oled.display();
@@ -460,7 +461,8 @@ void setup() {
     pinMode(BTN_NEXT, INPUT_PULLUP);
     pinMode(BTN_SEL,  INPUT_PULLUP);
 
-    Wire.begin(21, 22);                // [fix #1 — already correct; preserved]
+    Wire.begin(21, 22);
+    Wire.setClock(400000);             // 400kHz I2C: ~21ms/frame vs 83ms at default 100kHz
     if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // [fix #11 — already correct]
         Serial.println("SSD1306 init failed");
         while (true);
