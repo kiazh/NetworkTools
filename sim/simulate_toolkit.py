@@ -60,7 +60,8 @@ def test_pin_conflicts():
         "GPIO34/35/36/39 have no internal pullup" if bad_pullup else "GPIO32/33 support INPUT_PULLUP",
     )
 
-    spi_ok = all(pins[k] in {4, 5, 18, 19, 23} or pins[k] > 5 for k in ["NRF_SCK", "NRF_MOSI", "NRF_MISO"])
+    vspi_pins = {18, 19, 23}
+    spi_ok = all(pins[k] in vspi_pins for k in ["NRF_SCK", "NRF_MOSI", "NRF_MISO"])
     check("NRF24 on VSPI pins (18/19/23)", spi_ok)
     check("OLED on default I2C (21/22)", pins["OLED_SDA"] == 21 and pins["OLED_SCL"] == 22)
 
@@ -161,7 +162,7 @@ def test_nrf_spectrum():
         for ch in range(NRF_CH):
             rpd = ch in wifi_active and random.random() > 0.2
             if rpd:
-                power[ch] = min(255, power[ch] + 8)  # [fix #7] equal rise rate
+                power[ch] = min(248, power[ch] + 8)  # matches firmware cap of 248
             else:
                 power[ch] = max(0, power[ch] - 8)
 
@@ -219,7 +220,7 @@ def test_ble_scan():
         visible_pages.append([display_label(d) for d in page])
 
     check("Device count detected", len(mock_devices) == 5)
-    check("Unnamed device falls back to MAC", display_label(mock_devices[1]) == "AA:BB:CC:DD:EE")
+    check("Unnamed device falls back to MAC (first 14 chars)", display_label(mock_devices[1]) == "AA:BB:CC:DD:EE")
     check("Label truncated to 14 chars", all(len(display_label(d)) <= 14 for d in mock_devices))
     check("RSSI values in valid range", all(-100 <= d["rssi"] <= 0 for d in mock_devices))
     check("Scroll exposes all devices",
